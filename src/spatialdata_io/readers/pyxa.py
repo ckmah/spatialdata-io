@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Union
 
+import anndata as ad
 import dask.dataframe as dd
 import pandas as pd
 
@@ -33,3 +34,22 @@ def _get_points(path: Path) -> dd.DataFrame:
     )
     ddf[PyxaKeys.ASSIGNED.value] = ~ddf[PyxaKeys.CELL_ID.value].str.endswith(PyxaKeys.UNASSIGNED_SUFFIX.value)
     return ddf
+
+
+def _get_table(cell_by_gene_path: Path, cell_metadata_path: Path) -> ad.AnnData:
+    by_gene = pd.read_csv(cell_by_gene_path, index_col=PyxaKeys.CELL_ID.value, dtype={PyxaKeys.CELL_ID.value: str})
+    metadata = pd.read_csv(cell_metadata_path, index_col=PyxaKeys.CELL_ID.value, dtype={PyxaKeys.CELL_ID.value: str})
+
+    _validate_columns(
+        metadata,
+        {PyxaKeys.X_UM.value, PyxaKeys.Y_UM.value, PyxaKeys.Z_UM.value},
+        cell_metadata_path.name,
+    )
+
+    metadata = metadata.loc[by_gene.index]
+    spatial_cols = [PyxaKeys.X_UM.value, PyxaKeys.Y_UM.value, PyxaKeys.Z_UM.value]
+    adata = ad.AnnData(by_gene, obs=metadata.drop(columns=spatial_cols))
+    adata.obsm["spatial"] = metadata[spatial_cols].values
+    adata.obs[PyxaKeys.REGION_KEY.value] = pd.Series(PyxaKeys.REGION.value, index=adata.obs_names, dtype="category")
+    adata.obs[PyxaKeys.CELL_ID.value] = adata.obs_names
+    return adata

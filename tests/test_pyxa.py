@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from spatialdata_io._constants._constants import PyxaKeys
-from spatialdata_io.readers.pyxa import _get_points, _validate_columns
+from spatialdata_io.readers.pyxa import _get_points, _get_table, _validate_columns
 
 FIXTURE_DIR = Path(__file__).parent / "data" / "pyxa_test"
 
@@ -61,3 +61,20 @@ def test_get_points_has_required_coordinate_columns() -> None:
     computed = points.compute()
     for col in ("X_um", "Y_um", "Z_um", "Gene", "cell_id"):
         assert col in computed.columns
+
+
+def test_get_table_matches_raw_values() -> None:
+    adata = _get_table(
+        FIXTURE_DIR / "cell_by_gene_v1.csv",
+        FIXTURE_DIR / "cell_metadata_v1.csv",
+    )
+    raw_by_gene = pd.read_csv(FIXTURE_DIR / "cell_by_gene_v1.csv", index_col="cell_id")
+    raw_metadata = pd.read_csv(FIXTURE_DIR / "cell_metadata_v1.csv", index_col="cell_id")
+
+    assert adata.n_obs == len(raw_by_gene)
+    sample_cell = raw_by_gene.index[0]
+    sample_gene = raw_by_gene.columns[0]
+    assert adata[sample_cell, sample_gene].X[0, 0] == raw_by_gene.loc[sample_cell, sample_gene]
+
+    assert list(adata.obsm["spatial"][0]) == list(raw_metadata.loc[sample_cell, ["X_um", "Y_um", "Z_um"]])
+    assert (adata.obs["region"] == "cell_shapes").all()
