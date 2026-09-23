@@ -1,20 +1,24 @@
-from pathlib import Path
-
-import dask.dataframe as dd
-import pandas as pd
-import pytest
-
-from spatialdata_io._constants._constants import PyxaKeys
 import math
 import tempfile
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import dask.dataframe as dd
 import geopandas as gpd
+import pandas as pd
+import pytest
 from click.testing import CliRunner
 from spatialdata import get_extent, read_zarr
 
 from spatialdata_io.__main__ import pyxa_wrapper
-from spatialdata_io.readers.pyxa import _get_points, _get_shapes, _get_table, _validate_columns, pyxa
+from spatialdata_io._constants._constants import PyxaKeys
+from spatialdata_io.readers.pyxa import (
+    _get_points,
+    _get_shapes,
+    _get_table,
+    _validate_columns,
+    pyxa,
+)
 
 FIXTURE_DIR = Path(__file__).parent / "data" / "pyxa_test"
 

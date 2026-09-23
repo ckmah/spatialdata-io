@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union
 
 import anndata as ad
 import dask.dataframe as dd
@@ -18,7 +17,7 @@ from spatialdata_io._docs import inject_docs
 __all__ = ["pyxa"]
 
 
-def _validate_columns(df: Union[pd.DataFrame, dd.DataFrame], required: set[str], file_name: str) -> None:
+def _validate_columns(df: pd.DataFrame | dd.DataFrame, required: set[str], file_name: str) -> None:
     """Raise a clear ``ValueError`` naming the file and any missing required column(s)."""
     missing = required - set(df.columns)
     if missing:
