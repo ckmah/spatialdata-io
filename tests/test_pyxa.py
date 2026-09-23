@@ -1,4 +1,8 @@
+import pandas as pd
+import pytest
+
 from spatialdata_io._constants._constants import PyxaKeys
+from spatialdata_io.readers.pyxa import _validate_columns
 
 
 def test_pyxa_keys_filenames() -> None:
@@ -24,3 +28,14 @@ def test_pyxa_keys_columns() -> None:
     assert PyxaKeys.REGION == "cell_shapes"
     assert PyxaKeys.INSTANCE_KEY == "cell_id"
     assert PyxaKeys.ASSIGNED == "assigned"
+
+
+def test_validate_columns_passes_when_present() -> None:
+    df = pd.DataFrame({"cell_id": [1], "Gene": ["A"]})
+    _validate_columns(df, {"cell_id", "Gene"}, "test_file.csv")
+
+
+def test_validate_columns_raises_when_missing() -> None:
+    df = pd.DataFrame({"cell_id": [1]})
+    with pytest.raises(ValueError, match=r"test_file\.csv is missing required column\(s\): \['Gene'\]"):
+        _validate_columns(df, {"cell_id", "Gene"}, "test_file.csv")
