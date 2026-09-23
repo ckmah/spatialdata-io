@@ -48,6 +48,15 @@ Contributions for addressing the below limitations are very welcomed.
 
 - Only Stereo-seq 7.x is supported, 8.x is not currently supported. https://github.com/scverse/spatialdata-io/issues/161
 
+## Experimental readers
+
+Readers without (yet) a public specification for their raw data format live
+in `spatialdata_io.experimental` rather than the main technology list above.
+No stability guarantees are made for these.
+
+- Pyxa (Stellaromics/Meteor-APA pipeline output): analysis-group (AG) level
+  only; format derived from internal documentation, not a public spec.
+
 ## Getting started
 
 Please refer to the [documentation][link-docs]. In particular, the
