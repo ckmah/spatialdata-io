@@ -409,3 +409,41 @@ class VisiumHDKeys(ModeEnum):
     # Cell Segmentation keys
     CELL_SEG_KEY_HD = "cell_segmentations"
     NUCLEUS_SEG_KEY_HD = "nucleus_segmentations"
+
+
+class PyxaKeys(ModeEnum):
+    """Keys for *Pyxa* (Stellaromics/Meteor APA pipeline) analysis-group output.
+
+    No public specification exists yet; derived from internal Meteor/APA wiki
+    documentation (``Cell-Assigned-Gene.md``, ``Cell-By-Gene.md``,
+    ``Cell-Metadata.md``, ``Segmentation-Geometries.md``), cross-checked
+    against real analysis-group output.
+    """
+
+    # files
+    CELL_ASSIGNED_GENE_FILE = "cell_assigned_gene_v1.csv"
+    CELL_BY_GENE_FILE = "cell_by_gene_v1.csv"
+    CELL_METADATA_FILE = "cell_metadata_v1.csv"
+    SEGMENTATION_GEOMETRIES_FILE = "segmentation_geometries_v1.parquet"
+
+    # shared columns
+    CELL_ID = "cell_id"
+    GENE = "Gene"
+    X_UM = "X_um"
+    Y_UM = "Y_um"
+    Z_UM = "Z_um"
+    VOLUME_UM3 = "Volume_um3"
+    ROI = "ROI"
+    Z_INDEX = "ZIndex"
+    BORDER = "Border"
+    FOV = "FOV"
+
+    # unassigned transcripts (AG-level) have cell_id ending in this suffix,
+    # e.g. "Region_-1" -- NOT the literal "-1" the wiki spec describes.
+    UNASSIGNED_SUFFIX = "_-1"
+
+    # constructed metadata
+    REGION_KEY = "region"
+    REGION = "cell_shapes"
+    INSTANCE_KEY = "cell_id"
+    ASSIGNED = "assigned"
