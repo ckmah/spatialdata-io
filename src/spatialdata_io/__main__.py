@@ -910,6 +910,15 @@ def macsima_wrapper(
     sdata.write(output)
 
 
+@cli.command(name="pyxa")
+@_input_output_click_options
+@click.option("--dataset-id", type=str, default="pyxa", help="Dataset ID. [default: pyxa]")
+def pyxa_wrapper(input: str, output: str, dataset_id: str = "pyxa") -> None:
+    """Pyxa (Stellaromics/Meteor-APA) conversion to SpatialData"""
+    sdata = pyxa(input, dataset_id=dataset_id)  # type: ignore[name-defined] # noqa: F821
+    sdata.write(output)
+
+
 @cli.command(name="generic")
 @click.option(
     "--input",

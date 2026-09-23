@@ -7,10 +7,13 @@ import pytest
 from spatialdata_io._constants._constants import PyxaKeys
 import math
 import tempfile
+from tempfile import TemporaryDirectory
 
 import geopandas as gpd
-from spatialdata import get_extent
+from click.testing import CliRunner
+from spatialdata import get_extent, read_zarr
 
+from spatialdata_io.__main__ import pyxa_wrapper
 from spatialdata_io.readers.pyxa import _get_points, _get_shapes, _get_table, _validate_columns, pyxa
 
 FIXTURE_DIR = Path(__file__).parent / "data" / "pyxa_test"
@@ -111,3 +114,16 @@ def test_pyxa_reader_missing_file_raises() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         with pytest.raises(FileNotFoundError):
             pyxa(Path(tmpdir))
+
+
+def test_cli_pyxa() -> None:
+    runner = CliRunner()
+    with TemporaryDirectory() as tmpdir:
+        output_zarr = Path(tmpdir) / "data.zarr"
+        result = runner.invoke(
+            pyxa_wrapper,
+            ["--input", str(FIXTURE_DIR), "--output", str(output_zarr)],
+        )
+        assert result.exit_code == 0, result.output
+        sdata = read_zarr(output_zarr)
+        assert "transcripts" in sdata.points
