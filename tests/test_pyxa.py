@@ -1,8 +1,13 @@
+from pathlib import Path
+
+import dask.dataframe as dd
 import pandas as pd
 import pytest
 
 from spatialdata_io._constants._constants import PyxaKeys
-from spatialdata_io.readers.pyxa import _validate_columns
+from spatialdata_io.readers.pyxa import _get_points, _validate_columns
+
+FIXTURE_DIR = Path(__file__).parent / "data" / "pyxa_test"
 
 
 def test_pyxa_keys_filenames() -> None:
@@ -39,3 +44,20 @@ def test_validate_columns_raises_when_missing() -> None:
     df = pd.DataFrame({"cell_id": [1]})
     with pytest.raises(ValueError, match=r"test_file\.csv is missing required column\(s\): \['Gene'\]"):
         _validate_columns(df, {"cell_id", "Gene"}, "test_file.csv")
+
+
+def test_get_points_keeps_unassigned_transcripts() -> None:
+    points = _get_points(FIXTURE_DIR / "cell_assigned_gene_v1.csv")
+    assert isinstance(points, dd.DataFrame)
+    computed = points.compute()
+    assert "assigned" in computed.columns
+    assert (~computed["assigned"]).sum() > 0
+    assert computed[~computed["assigned"]]["cell_id"].str.endswith("_-1").all()
+    assert computed["assigned"].sum() > 0
+
+
+def test_get_points_has_required_coordinate_columns() -> None:
+    points = _get_points(FIXTURE_DIR / "cell_assigned_gene_v1.csv")
+    computed = points.compute()
+    for col in ("X_um", "Y_um", "Z_um", "Gene", "cell_id"):
+        assert col in computed.columns
