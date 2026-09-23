@@ -5,9 +5,13 @@ import pandas as pd
 import pytest
 
 from spatialdata_io._constants._constants import PyxaKeys
-import geopandas as gpd
+import math
+import tempfile
 
-from spatialdata_io.readers.pyxa import _get_points, _get_shapes, _get_table, _validate_columns
+import geopandas as gpd
+from spatialdata import get_extent
+
+from spatialdata_io.readers.pyxa import _get_points, _get_shapes, _get_table, _validate_columns, pyxa
 
 FIXTURE_DIR = Path(__file__).parent / "data" / "pyxa_test"
 
@@ -88,3 +92,22 @@ def test_get_shapes_matches_raw_row_count() -> None:
     assert len(gdf) == len(raw)
     assert all(isinstance(c, str) for c in gdf["cell_id"])
     assert gdf.geometry.is_valid.all()
+
+
+def test_pyxa_reader_builds_valid_sdata() -> None:
+    sdata = pyxa(FIXTURE_DIR)
+
+    assert "transcripts" in sdata.points
+    assert "cell_shapes" in sdata.shapes
+    assert "rna" in sdata.tables
+
+    raw_transcripts = pd.read_csv(FIXTURE_DIR / "cell_assigned_gene_v1.csv")
+    extent = get_extent(sdata["transcripts"])
+    assert math.floor(extent["x"][0]) <= math.floor(raw_transcripts["X_um"].min())
+    assert math.ceil(extent["x"][1]) >= math.ceil(raw_transcripts["X_um"].max())
+
+
+def test_pyxa_reader_missing_file_raises() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(FileNotFoundError):
+            pyxa(Path(tmpdir))
