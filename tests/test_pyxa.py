@@ -5,7 +5,9 @@ import pandas as pd
 import pytest
 
 from spatialdata_io._constants._constants import PyxaKeys
-from spatialdata_io.readers.pyxa import _get_points, _get_table, _validate_columns
+import geopandas as gpd
+
+from spatialdata_io.readers.pyxa import _get_points, _get_shapes, _get_table, _validate_columns
 
 FIXTURE_DIR = Path(__file__).parent / "data" / "pyxa_test"
 
@@ -78,3 +80,11 @@ def test_get_table_matches_raw_values() -> None:
 
     assert list(adata.obsm["spatial"][0]) == list(raw_metadata.loc[sample_cell, ["X_um", "Y_um", "Z_um"]])
     assert (adata.obs["region"] == "cell_shapes").all()
+
+
+def test_get_shapes_matches_raw_row_count() -> None:
+    gdf = _get_shapes(FIXTURE_DIR / "segmentation_geometries_v1.parquet")
+    raw = gpd.read_parquet(FIXTURE_DIR / "segmentation_geometries_v1.parquet")
+    assert len(gdf) == len(raw)
+    assert all(isinstance(c, str) for c in gdf["cell_id"])
+    assert gdf.geometry.is_valid.all()

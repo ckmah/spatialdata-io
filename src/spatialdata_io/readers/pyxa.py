@@ -5,7 +5,10 @@ from typing import Union
 
 import anndata as ad
 import dask.dataframe as dd
+import geopandas as gpd
 import pandas as pd
+import pyarrow.parquet as pq
+import shapely
 
 from spatialdata_io._constants._constants import PyxaKeys
 
@@ -53,3 +56,21 @@ def _get_table(cell_by_gene_path: Path, cell_metadata_path: Path) -> ad.AnnData:
     adata.obs[PyxaKeys.REGION_KEY.value] = pd.Series(PyxaKeys.REGION.value, index=adata.obs_names, dtype="category")
     adata.obs[PyxaKeys.CELL_ID.value] = adata.obs_names
     return adata
+
+
+def _get_shapes(path: Path) -> gpd.GeoDataFrame:
+    parquet_file = pq.ParquetFile(path)
+    chunks = []
+    for batch in parquet_file.iter_batches():
+        chunk = batch.to_pandas()
+        chunk["geometry"] = shapely.from_wkb(chunk["geometry"])
+        chunks.append(gpd.GeoDataFrame(chunk, geometry="geometry"))
+    gdf = pd.concat(chunks, ignore_index=True)
+    gdf = gpd.GeoDataFrame(gdf, geometry="geometry")
+
+    _validate_columns(gdf, {PyxaKeys.CELL_ID.value, PyxaKeys.Z_INDEX.value}, path.name)
+
+    gdf[PyxaKeys.CELL_ID.value] = gdf[PyxaKeys.CELL_ID.value].astype(str)
+    gdf = gdf[gdf.geometry.is_valid]
+    gdf.index = gdf[PyxaKeys.CELL_ID.value]
+    return gdf
