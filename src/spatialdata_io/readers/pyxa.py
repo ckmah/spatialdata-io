@@ -3,13 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 
 import anndata as ad
+import dask.array as da
 import dask.dataframe as dd
 import geopandas as gpd
 import pandas as pd
 import pyarrow.parquet as pq
 import shapely
+import zarr
 from spatialdata import SpatialData
-from spatialdata.models import PointsModel, ShapesModel, TableModel
+from spatialdata.models import Image3DModel, PointsModel, ShapesModel, TableModel
+from spatialdata.transformations import Scale, Sequence, Translation
+from xarray import DataArray
 
 from spatialdata_io._constants._constants import PyxaKeys
 from spatialdata_io._docs import inject_docs
@@ -78,8 +82,45 @@ def _get_shapes(path: Path) -> gpd.GeoDataFrame:
     return gdf
 
 
+def _get_image(path: Path) -> DataArray:
+    """Load the full-resolution level of an OME-Zarr (OME-NGFF v0.5) mosaic image.
+
+    Only the highest-resolution dataset (index 0 in the multiscale metadata,
+    conventionally ``scale0``) is read; the reader does not (yet) reuse the
+    precomputed lower-resolution pyramid levels also present in the store.
+    """
+    group = zarr.open_group(store=str(path), mode="r")
+    multiscale = group.attrs["ome"]["multiscales"][0]
+    dataset0 = multiscale["datasets"][0]
+
+    axes = tuple(a["name"] for a in multiscale["axes"])
+    array = da.from_zarr(str(path), component=dataset0["path"])
+
+    # drop the singleton "t" axis, which spatialdata's image models don't model
+    t_index = axes.index("t")
+    array = da.squeeze(array, axis=t_index)
+    axes = tuple(a for a in axes if a != "t")
+
+    coordinate_transformations = {ct["type"]: ct for ct in dataset0["coordinateTransformations"]}
+    scale_values = [v for v, a in zip(coordinate_transformations["scale"]["scale"], multiscale["axes"]) if a["name"] != "t"]
+    translation_values = [
+        v for v, a in zip(coordinate_transformations["translation"]["translation"], multiscale["axes"]) if a["name"] != "t"
+    ]
+    transformation = Sequence(
+        [
+            Scale(scale_values, axes=axes),
+            Translation(translation_values, axes=axes),
+        ]
+    )
+
+    channel_labels = [c.get("label") for c in group.attrs.get("ome", {}).get("omero", {}).get("channels", [])]
+    c_coords = channel_labels if len(channel_labels) == array.shape[axes.index("c")] else None
+
+    return Image3DModel.parse(array, dims=axes, c_coords=c_coords, transformations={"global": transformation})
+
+
 @inject_docs(px=PyxaKeys)
-def pyxa(path: str | Path, dataset_id: str = "pyxa") -> SpatialData:
+def pyxa(path: str | Path, dataset_id: str = "pyxa", image_path: str | Path | None = None) -> SpatialData:
     """
     Read *Pyxa* (Stellaromics/Meteor-APA pipeline) analysis-group output.
 
@@ -103,6 +144,12 @@ def pyxa(path: str | Path, dataset_id: str = "pyxa") -> SpatialData:
     dataset_id
         Dataset identifier, currently unused for element naming (reserved for
         future multi-sample support).
+    image_path
+        Optional path to a mosaic OME-Zarr (OME-NGFF v0.5) directory, e.g. a
+        DAPI mosaic. Not colocated with the other 4 files in Pyxa's output
+        layout, so it must be given explicitly. Only the full-resolution
+        level is read (see :func:`_get_image`). If ``None``, no image is
+        included in the returned :class:`~spatialdata.SpatialData`.
 
     Returns
     -------
@@ -134,8 +181,16 @@ def pyxa(path: str | Path, dataset_id: str = "pyxa") -> SpatialData:
         instance_key=PyxaKeys.INSTANCE_KEY.value,
     )
 
+    images = {}
+    if image_path is not None:
+        image_path = Path(image_path)
+        if not image_path.exists():
+            raise FileNotFoundError(f"Expected Pyxa mosaic image not found: {image_path}")
+        images[PyxaKeys.MOSAIC_IMAGE.value] = _get_image(image_path)
+
     return SpatialData(
         points={"transcripts": points},
         shapes={PyxaKeys.REGION.value: shapes},
         tables={"rna": table},
+        images=images,
     )

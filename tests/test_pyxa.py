@@ -5,14 +5,17 @@ from tempfile import TemporaryDirectory
 
 import dask.dataframe as dd
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import pytest
+import zarr
 from click.testing import CliRunner
 from spatialdata import get_extent, read_zarr
 
 from spatialdata_io.__main__ import pyxa_wrapper
 from spatialdata_io._constants._constants import PyxaKeys
 from spatialdata_io.readers.pyxa import (
+    _get_image,
     _get_points,
     _get_shapes,
     _get_table,
@@ -21,6 +24,39 @@ from spatialdata_io.readers.pyxa import (
 )
 
 FIXTURE_DIR = Path(__file__).parent / "data" / "pyxa_test"
+
+
+def _make_tiny_ome_zarr(path: Path) -> None:
+    """Build a minimal single-scale OME-NGFF v0.5 store, shape (t=1, c=1, z=2, y=4, x=4)."""
+    data = np.arange(2 * 4 * 4, dtype="uint8").reshape(1, 1, 2, 4, 4)
+    group = zarr.open_group(store=str(path), mode="w")
+    array = group.create_array("scale0/image", shape=data.shape, dtype=data.dtype, dimension_names=["t", "c", "z", "y", "x"])
+    array[:] = data
+    group.attrs["ome"] = {
+        "version": "0.5",
+        "multiscales": [
+            {
+                "axes": [
+                    {"name": "t", "type": "time"},
+                    {"name": "c", "type": "channel"},
+                    {"name": "z", "type": "space"},
+                    {"name": "y", "type": "space"},
+                    {"name": "x", "type": "space"},
+                ],
+                "datasets": [
+                    {
+                        "path": "scale0/image",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [1.0, 1.0, 0.5, 0.2, 0.2]},
+                            {"type": "translation", "translation": [0.0, 0.0, 1.0, 2.0, 3.0]},
+                        ],
+                    },
+                ],
+                "name": "image",
+            }
+        ],
+        "omero": {"channels": [{"label": "DAPI"}]},
+    }
 
 
 def test_pyxa_keys_filenames() -> None:
@@ -118,6 +154,34 @@ def test_pyxa_reader_missing_file_raises() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         with pytest.raises(FileNotFoundError):
             pyxa(Path(tmpdir))
+
+
+def test_get_image_loads_full_resolution_level() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zarr_path = Path(tmpdir) / "tiny.ome.zarr"
+        _make_tiny_ome_zarr(zarr_path)
+
+        image = _get_image(zarr_path)
+        assert image.dims == ("c", "z", "y", "x")
+        assert image.shape == (1, 2, 4, 4)
+        assert list(image.coords["c"].values) == ["DAPI"]
+        np.testing.assert_array_equal(image.values, np.arange(2 * 4 * 4, dtype="uint8").reshape(1, 2, 4, 4))
+
+
+def test_pyxa_reader_includes_image_when_given() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zarr_path = Path(tmpdir) / "tiny.ome.zarr"
+        _make_tiny_ome_zarr(zarr_path)
+
+        sdata = pyxa(FIXTURE_DIR, image_path=zarr_path)
+        assert "mosaic_image" in sdata.images
+        assert sdata["mosaic_image"].shape == (1, 2, 4, 4)
+
+
+def test_pyxa_reader_missing_image_raises() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(FileNotFoundError):
+            pyxa(FIXTURE_DIR, image_path=Path(tmpdir) / "does_not_exist.ome.zarr")
 
 
 def test_cli_pyxa() -> None:

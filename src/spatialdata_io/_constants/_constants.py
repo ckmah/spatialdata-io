@@ -447,3 +447,4 @@ class PyxaKeys(ModeEnum):
     REGION = "cell_shapes"
     INSTANCE_KEY = "cell_id"
     ASSIGNED = "assigned"
+    MOSAIC_IMAGE = "mosaic_image"
