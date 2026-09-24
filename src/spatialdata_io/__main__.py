@@ -920,7 +920,7 @@ def macsima_wrapper(
     help="Path to a mosaic OME-Zarr image directory (e.g. DAPI). [default: None]",
 )
 def pyxa_wrapper(input: str, output: str, dataset_id: str = "pyxa", image_path: str | None = None) -> None:
-    """Pyxa (Stellaromics/Meteor-APA) conversion to SpatialData."""
+    """Pyxa (Stellaromics) conversion to SpatialData."""
     from spatialdata_io.experimental import pyxa
 
     sdata = pyxa(input, dataset_id=dataset_id, image_path=image_path)

@@ -7,11 +7,13 @@ import anndata as ad
 import dask.array as da
 import dask.dataframe as dd
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import shapely
 import zarr
 from spatialdata import SpatialData
+from spatialdata._logging import logger
 from spatialdata.models import Image3DModel, PointsModel, ShapesModel, TableModel
 from spatialdata.transformations import Scale, Sequence, Translation
 from xarray import DataArray
@@ -43,6 +45,8 @@ def _get_points(path: Path) -> dd.DataFrame:
         path.name,
     )
     ddf[PyxaKeys.ASSIGNED.value] = ~ddf[PyxaKeys.CELL_ID.value].str.endswith(PyxaKeys.UNASSIGNED_SUFFIX.value)
+    # PointsModel needs known feature categories; computing them here is one pass over the gene column
+    ddf[PyxaKeys.GENE.value] = ddf[PyxaKeys.GENE.value].astype("category").cat.as_known()
     return ddf
 
 
@@ -65,7 +69,75 @@ def _get_table(cell_by_gene_path: Path, cell_metadata_path: Path) -> ad.AnnData:
     return adata
 
 
-def _get_shapes(path: Path) -> gpd.GeoDataFrame:
+def _get_voxel_size(cell_metadata_path: Path, n_rows: int = 10_000) -> tuple[float, float]:
+    """Infer the (xy, z) voxel size in um of the segmentation polygons from the per-cell metadata.
+
+    Polygons are stored in pixel coordinates (xy) with a z-plane index (``ZIndex``), while points
+    and the table use micrometers. The metadata carries each cell centroid in both units, related
+    by a pure scale per axis (no offset), so each size is a least-squares fit through the origin.
+    A pure scale is fully determined by a few cells, so only the first ``n_rows`` cells are read;
+    the fit is then checked to reproduce every sampled cell, and an error is raised if it does not.
+    """
+    columns = [
+        PyxaKeys.X_UM.value,
+        PyxaKeys.Y_UM.value,
+        PyxaKeys.Z_UM.value,
+        PyxaKeys.X_PIXELS.value,
+        PyxaKeys.Y_PIXELS.value,
+        PyxaKeys.Z_PIXELS.value,
+    ]
+    metadata = pd.read_csv(cell_metadata_path, usecols=lambda c: c in columns, nrows=n_rows)
+    _validate_columns(metadata, set(columns), cell_metadata_path.name)
+
+    def fit(um_cols: list[str], px_cols: list[str]) -> float:
+        um = metadata[um_cols].to_numpy().ravel()
+        px = metadata[px_cols].to_numpy().ravel()
+        size = float(np.dot(um, px) / np.dot(px, px))
+        residual = np.abs(um - size * px).max()
+        if residual > 1e-6 * max(np.abs(um).max(), 1.0):
+            raise ValueError(
+                f"{cell_metadata_path.name}: {um_cols} and {px_cols} are not related by a pure scale "
+                f"(max residual {residual:.3g} um with a fitted size of {size:.6g} um/pixel)"
+            )
+        return size
+
+    xy = fit([PyxaKeys.X_UM.value, PyxaKeys.Y_UM.value], [PyxaKeys.X_PIXELS.value, PyxaKeys.Y_PIXELS.value])
+    z = fit([PyxaKeys.Z_UM.value], [PyxaKeys.Z_PIXELS.value])
+    return xy, z
+
+
+def _polygonal_part(geometry: shapely.Geometry) -> shapely.Geometry:
+    """Keep only the (multi)polygonal part of a geometry, dropping any lines or points."""
+    if isinstance(geometry, shapely.Polygon | shapely.MultiPolygon):
+        return geometry
+    polygons = [p for p in shapely.get_parts(geometry) if isinstance(p, shapely.Polygon)]
+    return shapely.MultiPolygon(polygons) if len(polygons) > 1 else polygons[0] if polygons else shapely.Polygon()
+
+
+def _make_polygonal_valid(geometries: np.ndarray) -> np.ndarray:
+    """Repair invalid geometries in place of dropping them, keeping each one a (Multi)Polygon.
+
+    Valid geometries are returned untouched. Invalid ones are repaired with
+    :func:`shapely.make_valid` (``"structure"`` method), which rebuilds the polygon from its
+    rings, and any zero-area parts produced by the repair (lines, points) are discarded.
+    """
+    geometries = geometries.copy()
+    invalid = ~shapely.is_valid(geometries)
+    if invalid.any():
+        repaired = shapely.make_valid(geometries[invalid], method="structure", keep_collapsed=False)
+        geometries[invalid] = [_polygonal_part(g) for g in repaired]
+    return geometries
+
+
+def _get_shapes(path: Path, xy_size: float, z_size: float) -> gpd.GeoDataFrame:
+    """Read the per-cell, per-z-plane segmentation polygons and convert them to micrometers.
+
+    xy coordinates are scaled from pixels by ``xy_size``. Since shapes are 2D in spatialdata, z is
+    stored as a ``Z_um`` column: plane ``k`` spans ``[k, k + 1)`` in ``Z_pixels`` units, so its
+    centre sits at ``(k + 0.5) * z_size``. Scaling can turn polygons that touch themselves at a
+    single vertex into self-intersecting ones through floating point rounding, so the scaled
+    geometries are repaired and then validated.
+    """
     parquet_file = pq.ParquetFile(path)
     chunks = []
     for batch in parquet_file.iter_batches():
@@ -78,7 +150,26 @@ def _get_shapes(path: Path) -> gpd.GeoDataFrame:
     _validate_columns(gdf, {PyxaKeys.CELL_ID.value, PyxaKeys.Z_INDEX.value}, path.name)
 
     gdf[PyxaKeys.CELL_ID.value] = gdf[PyxaKeys.CELL_ID.value].astype(str)
-    gdf = gdf[gdf.geometry.is_valid]
+    gdf[PyxaKeys.Z_UM.value] = (gdf[PyxaKeys.Z_INDEX.value] + 0.5) * z_size
+
+    scaled = shapely.transform(gdf.geometry.to_numpy(), lambda coords: coords * xy_size)
+    n_invalid = int((~shapely.is_valid(scaled)).sum())
+    fixed = _make_polygonal_valid(scaled)
+    if n_invalid:
+        area_change = np.abs(shapely.area(fixed) - shapely.area(scaled)) / np.maximum(shapely.area(scaled), 1e-12)
+        logger.info(
+            f"{path.name}: repaired {n_invalid} invalid polygon(s) after scaling to micrometers "
+            f"(max relative area change {area_change.max():.2g})"
+        )
+    gdf = gdf.set_geometry(fixed)
+
+    empty = gdf.geometry.is_empty.to_numpy()
+    if empty.any():
+        logger.warning(f"{path.name}: dropping {int(empty.sum())} polygon(s) with no area left after repair")
+        gdf = gdf[~empty]
+    if not gdf.geometry.is_valid.all() or not set(gdf.geom_type) <= {"Polygon", "MultiPolygon"}:
+        raise ValueError(f"{path.name}: segmentation polygons are still invalid or non-polygonal after repair")
+
     gdf.index = gdf[PyxaKeys.CELL_ID.value]
     return gdf
 
@@ -130,7 +221,7 @@ def _get_image(path: Path) -> DataArray:
 @inject_docs(px=PyxaKeys)
 def pyxa(path: str | Path, dataset_id: str = "pyxa", image_path: str | Path | None = None) -> SpatialData:
     """
-    Read *Pyxa* (Stellaromics/Meteor-APA pipeline) analysis-group output.
+    Read *Pyxa* (Stellaromics) output.
 
     This function reads the following files:
 
@@ -139,11 +230,20 @@ def pyxa(path: str | Path, dataset_id: str = "pyxa", image_path: str | Path | No
         - ``{px.CELL_METADATA_FILE!r}``: Per-cell metadata (volume, spatial coordinates).
         - ``{px.SEGMENTATION_GEOMETRIES_FILE!r}``: Per-cell segmentation polygons.
 
-    Only analysis-group (AG) level output is supported. No public specification
-    exists for this format at the time of writing; this reader is derived from
-    internal documentation and validated against real analysis-group output.
-    Unassigned transcripts (``cell_id`` ending in ``"_-1"``) are kept in the
-    points table, flagged via an ``assigned`` column, rather than dropped.
+    No public specification exists for this format at the time of writing; this
+    reader is validated against the public demo dataset at
+    https://huggingface.co/datasets/Stellaromics/demo.
+
+    All elements are returned in micrometers in the ``global`` coordinate
+    system. Segmentation polygons are stored on disk in pixel units, one polygon
+    per cell per z-plane (``ZIndex``); the reader converts them to micrometers
+    (repairing any polygon that the conversion makes invalid) and adds their z
+    as a ``Z_um`` column (the centre of the z-plane), since shapes are 2D in
+    spatialdata. Both voxel sizes are inferred from ``{px.CELL_METADATA_FILE!r}``,
+    whose per-cell centroids are the area-weighted centroids of each cell's
+    polygons in both units. Unassigned
+    transcripts (``cell_id`` ending in ``"_-1"``) are kept in the points
+    table, flagged via an ``assigned`` column, rather than dropped.
 
     Parameters
     ----------
@@ -180,7 +280,8 @@ def pyxa(path: str | Path, dataset_id: str = "pyxa", image_path: str | Path | No
         instance_key=PyxaKeys.CELL_ID.value,
     )
 
-    shapes = ShapesModel.parse(_get_shapes(geometries_path))
+    xy_size, z_size = _get_voxel_size(metadata_path)
+    shapes = ShapesModel.parse(_get_shapes(geometries_path, xy_size, z_size))
 
     table = TableModel.parse(
         _get_table(by_gene_path, metadata_path),

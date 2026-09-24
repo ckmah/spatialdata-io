@@ -24,9 +24,7 @@ uv.lock
 /data/
 /node_modules/
 /.coverage*
-/tests/data/*
-# small checked-in fixture for the Pyxa reader (no public data host exists for it)
-!/tests/data/pyxa_test/
+/tests/data/
 
 # docs
 /docs/generated/

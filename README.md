@@ -54,8 +54,8 @@ Readers without (yet) a public specification for their raw data format live
 in `spatialdata_io.experimental` rather than the main technology list above.
 No stability guarantees are made for these.
 
-- Pyxa (Stellaromics/Meteor-APA pipeline output): analysis-group (AG) level
-  only; format derived from internal documentation, not a public spec.
+- Pyxa (Stellaromics): no public format specification yet; validated against
+  the public [demo dataset](https://huggingface.co/datasets/Stellaromics/demo).
 
 ## Getting started
 

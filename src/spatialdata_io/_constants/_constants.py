@@ -412,12 +412,10 @@ class VisiumHDKeys(ModeEnum):
 
 
 class PyxaKeys(ModeEnum):
-    """Keys for *Pyxa* (Stellaromics/Meteor APA pipeline) analysis-group output.
+    """Keys for *Pyxa* (Stellaromics) output.
 
-    No public specification exists yet; derived from internal Meteor/APA wiki
-    documentation (``Cell-Assigned-Gene.md``, ``Cell-By-Gene.md``,
-    ``Cell-Metadata.md``, ``Segmentation-Geometries.md``), cross-checked
-    against real analysis-group output.
+    No public specification exists yet; keys are validated against the public
+    demo dataset at https://huggingface.co/datasets/Stellaromics/demo.
     """
 
     # files
@@ -432,14 +430,16 @@ class PyxaKeys(ModeEnum):
     X_UM = "X_um"
     Y_UM = "Y_um"
     Z_UM = "Z_um"
+    X_PIXELS = "X_pixels"
+    Y_PIXELS = "Y_pixels"
+    Z_PIXELS = "Z_pixels"
     VOLUME_UM3 = "Volume_um3"
     ROI = "ROI"
     Z_INDEX = "ZIndex"
     BORDER = "Border"
     FOV = "FOV"
 
-    # unassigned transcripts (AG-level) have cell_id ending in this suffix,
-    # e.g. "Region_-1" -- NOT the literal "-1" the wiki spec describes.
+    # unassigned transcripts have cell_id ending in this suffix, e.g. "Region_-1"
     UNASSIGNED_SUFFIX = "_-1"
 
     # constructed metadata
