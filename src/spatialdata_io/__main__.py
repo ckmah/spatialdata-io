@@ -913,9 +913,17 @@ def macsima_wrapper(
 @cli.command(name="pyxa")
 @_input_output_click_options
 @click.option("--dataset-id", type=str, default="pyxa", help="Dataset ID. [default: pyxa]")
-def pyxa_wrapper(input: str, output: str, dataset_id: str = "pyxa") -> None:
-    """Pyxa (Stellaromics/Meteor-APA) conversion to SpatialData"""
-    sdata = pyxa(input, dataset_id=dataset_id)  # type: ignore[name-defined] # noqa: F821
+@click.option(
+    "--image-path",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    default=None,
+    help="Path to a mosaic OME-Zarr image directory (e.g. DAPI). [default: None]",
+)
+def pyxa_wrapper(input: str, output: str, dataset_id: str = "pyxa", image_path: str | None = None) -> None:
+    """Pyxa (Stellaromics/Meteor-APA) conversion to SpatialData."""
+    from spatialdata_io.experimental import pyxa
+
+    sdata = pyxa(input, dataset_id=dataset_id, image_path=image_path)
     sdata.write(output)
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import anndata as ad
 import dask.array as da
@@ -90,7 +91,8 @@ def _get_image(path: Path) -> DataArray:
     precomputed lower-resolution pyramid levels also present in the store.
     """
     group = zarr.open_group(store=str(path), mode="r")
-    multiscale = group.attrs["ome"]["multiscales"][0]
+    ome = cast("dict[str, Any]", group.attrs.asdict()["ome"])
+    multiscale = ome["multiscales"][0]
     dataset0 = multiscale["datasets"][0]
 
     axes = tuple(a["name"] for a in multiscale["axes"])
@@ -102,9 +104,15 @@ def _get_image(path: Path) -> DataArray:
     axes = tuple(a for a in axes if a != "t")
 
     coordinate_transformations = {ct["type"]: ct for ct in dataset0["coordinateTransformations"]}
-    scale_values = [v for v, a in zip(coordinate_transformations["scale"]["scale"], multiscale["axes"]) if a["name"] != "t"]
+    scale_values = [
+        v
+        for v, a in zip(coordinate_transformations["scale"]["scale"], multiscale["axes"], strict=True)
+        if a["name"] != "t"
+    ]
     translation_values = [
-        v for v, a in zip(coordinate_transformations["translation"]["translation"], multiscale["axes"]) if a["name"] != "t"
+        v
+        for v, a in zip(coordinate_transformations["translation"]["translation"], multiscale["axes"], strict=True)
+        if a["name"] != "t"
     ]
     transformation = Sequence(
         [
@@ -113,7 +121,7 @@ def _get_image(path: Path) -> DataArray:
         ]
     )
 
-    channel_labels = [c.get("label") for c in group.attrs.get("ome", {}).get("omero", {}).get("channels", [])]
+    channel_labels = [c.get("label") for c in ome.get("omero", {}).get("channels", [])]
     c_coords = channel_labels if len(channel_labels) == array.shape[axes.index("c")] else None
 
     return Image3DModel.parse(array, dims=axes, c_coords=c_coords, transformations={"global": transformation})

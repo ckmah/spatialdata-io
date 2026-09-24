@@ -28,6 +28,7 @@ SEGMENTATION_GEOMETRIES_FILE = "segmentation_geometries_v1.parquet"
 
 
 def main(source_dir: Path, out_dir: Path) -> None:
+    """Subsample the first N_CELLS cells (plus unassigned transcripts) from source_dir into out_dir."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
     metadata = pd.read_csv(source_dir / CELL_METADATA_FILE)

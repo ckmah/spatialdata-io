@@ -30,7 +30,9 @@ def _make_tiny_ome_zarr(path: Path) -> None:
     """Build a minimal single-scale OME-NGFF v0.5 store, shape (t=1, c=1, z=2, y=4, x=4)."""
     data = np.arange(2 * 4 * 4, dtype="uint8").reshape(1, 1, 2, 4, 4)
     group = zarr.open_group(store=str(path), mode="w")
-    array = group.create_array("scale0/image", shape=data.shape, dtype=data.dtype, dimension_names=["t", "c", "z", "y", "x"])
+    array = group.create_array(
+        "scale0/image", shape=data.shape, dtype=data.dtype, dimension_names=["t", "c", "z", "y", "x"]
+    )
     array[:] = data
     group.attrs["ome"] = {
         "version": "0.5",
@@ -123,7 +125,7 @@ def test_get_table_matches_raw_values() -> None:
     assert adata.n_obs == len(raw_by_gene)
     sample_cell = raw_by_gene.index[0]
     sample_gene = raw_by_gene.columns[0]
-    assert adata[sample_cell, sample_gene].X[0, 0] == raw_by_gene.loc[sample_cell, sample_gene]
+    assert adata[sample_cell, sample_gene].to_df().iloc[0, 0] == raw_by_gene.loc[sample_cell, sample_gene]
 
     assert list(adata.obsm["spatial"][0]) == list(raw_metadata.loc[sample_cell, ["X_um", "Y_um", "Z_um"]])
     assert (adata.obs["region"] == "cell_shapes").all()
