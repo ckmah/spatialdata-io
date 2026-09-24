@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
@@ -15,8 +16,8 @@ import zarr
 from spatialdata import SpatialData
 from spatialdata._logging import logger
 from spatialdata.models import Image3DModel, PointsModel, ShapesModel, TableModel
-from spatialdata.transformations import Scale, Sequence, Translation
-from xarray import DataArray
+from spatialdata.transformations import Scale, Sequence, Translation, set_transformation
+from xarray import DataArray, Dataset, DataTree
 
 from spatialdata_io._constants._constants import PyxaKeys
 from spatialdata_io._docs import inject_docs
@@ -66,6 +67,8 @@ def _get_table(cell_by_gene_path: Path, cell_metadata_path: Path) -> ad.AnnData:
     adata.obsm["spatial"] = metadata[spatial_cols].values
     adata.obs[PyxaKeys.REGION_KEY.value] = pd.Series(PyxaKeys.REGION.value, index=adata.obs_names, dtype="category")
     adata.obs[PyxaKeys.CELL_ID.value] = adata.obs_names
+    # the cell_id column carries the instance key; an index with the same name breaks table joins
+    adata.obs.index.name = None
     return adata
 
 
@@ -170,52 +173,85 @@ def _get_shapes(path: Path, xy_size: float, z_size: float) -> gpd.GeoDataFrame:
     if not gdf.geometry.is_valid.all() or not set(gdf.geom_type) <= {"Polygon", "MultiPolygon"}:
         raise ValueError(f"{path.name}: segmentation polygons are still invalid or non-polygonal after repair")
 
-    gdf.index = gdf[PyxaKeys.CELL_ID.value]
-    return gdf
+    return gdf.reset_index(drop=True)
 
 
-def _get_image(path: Path) -> DataArray:
-    """Load the full-resolution level of an OME-Zarr (OME-NGFF v0.5) mosaic image.
+def _get_footprints(planes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Merge each cell's z-plane polygons into one 2D footprint, indexed by cell id.
 
-    Only the highest-resolution dataset (index 0 in the multiscale metadata,
-    conventionally ``scale0``) is read; the reader does not (yet) reuse the
-    precomputed lower-resolution pyramid levels also present in the store.
+    A table can only annotate an element with one row per instance, so the per-plane polygons are
+    kept as a separate element and the table annotates these footprints instead. The union is the
+    expensive step and is independent per cell; shapely releases the GIL, so cells are merged in a
+    thread pool.
+    """
+    cell_ids = planes[PyxaKeys.CELL_ID.value].to_numpy()
+    order = np.argsort(cell_ids, kind="stable")
+    cell_ids, geometries = cell_ids[order], planes.geometry.to_numpy()[order]
+    unique_ids, starts = np.unique(cell_ids, return_index=True)
+    stops = np.append(starts[1:], len(cell_ids))
+
+    with ThreadPoolExecutor() as executor:
+        unions = list(
+            executor.map(lambda bounds: shapely.union_all(geometries[slice(*bounds)]), zip(starts, stops, strict=True))
+        )
+
+    footprints = gpd.GeoDataFrame(
+        geometry=_make_polygonal_valid(np.array(unions, dtype=object)),
+        index=pd.Index(unique_ids, name=PyxaKeys.CELL_ID.value),
+    )
+    if not footprints.geometry.is_valid.all():
+        raise ValueError("cell footprints are invalid after merging the z-plane polygons")
+    return footprints
+
+
+def _get_image(path: Path) -> DataTree:
+    """Load every level of an OME-Zarr (OME-NGFF v0.5) mosaic image as a multiscale image.
+
+    The pyramid levels already in the store are opened lazily, not recomputed. As in spatialdata's
+    own OME-Zarr reader, the ``global`` transformation comes from the full-resolution level and
+    each coarser level is related to it by the ratio of the array shapes.
     """
     group = zarr.open_group(store=str(path), mode="r")
     ome = cast("dict[str, Any]", group.attrs.asdict()["ome"])
     multiscale = ome["multiscales"][0]
-    dataset0 = multiscale["datasets"][0]
-
-    axes = tuple(a["name"] for a in multiscale["axes"])
-    array = da.from_zarr(str(path), component=dataset0["path"])
+    datasets = multiscale["datasets"]
 
     # drop the singleton "t" axis, which spatialdata's image models don't model
-    t_index = axes.index("t")
-    array = da.squeeze(array, axis=t_index)
-    axes = tuple(a for a in axes if a != "t")
+    all_axes = [a["name"] for a in multiscale["axes"]]
+    t_index = all_axes.index("t")
+    axes = tuple(a for a in all_axes if a != "t")
+    arrays = [da.squeeze(da.from_zarr(str(path), component=d["path"]), axis=t_index) for d in datasets]
 
-    coordinate_transformations = {ct["type"]: ct for ct in dataset0["coordinateTransformations"]}
+    coordinate_transformations = {ct["type"]: ct for ct in datasets[0]["coordinateTransformations"]}
+    spatial_axes = tuple(a for a in axes if a != "c")
     scale_values = [
-        v
-        for v, a in zip(coordinate_transformations["scale"]["scale"], multiscale["axes"], strict=True)
-        if a["name"] != "t"
+        v for v, a in zip(coordinate_transformations["scale"]["scale"], all_axes, strict=True) if a in spatial_axes
     ]
     translation_values = [
         v
-        for v, a in zip(coordinate_transformations["translation"]["translation"], multiscale["axes"], strict=True)
-        if a["name"] != "t"
+        for v, a in zip(coordinate_transformations["translation"]["translation"], all_axes, strict=True)
+        if a in spatial_axes
     ]
     transformation = Sequence(
-        [
-            Scale(scale_values, axes=axes),
-            Translation(translation_values, axes=axes),
-        ]
+        [Scale(scale_values, axes=spatial_axes), Translation(translation_values, axes=spatial_axes)]
     )
 
+    n_channels = arrays[0].shape[axes.index("c")]
     channel_labels = [c.get("label") for c in ome.get("omero", {}).get("channels", [])]
-    c_coords = channel_labels if len(channel_labels) == array.shape[axes.index("c")] else None
+    c_coords = channel_labels if len(channel_labels) == n_channels else list(range(n_channels))
 
-    return Image3DModel.parse(array, dims=axes, c_coords=c_coords, transformations={"global": transformation})
+    levels = {}
+    for i, array in enumerate(arrays):
+        # coordinates of every level are pixel centres in scale0 pixel units, as spatialdata assigns them
+        coords: dict[str, Any] = {"c": c_coords}
+        for ax in spatial_axes:
+            n0, n = arrays[0].shape[axes.index(ax)], array.shape[axes.index(ax)]
+            coords[ax] = np.linspace(0, n0, n + 1)[:-1] + n0 / n / 2
+        levels[f"scale{i}"] = Dataset({"image": DataArray(array, dims=axes, coords=coords)})
+    image = DataTree.from_dict(levels)
+    set_transformation(image, {"global": transformation}, set_all=True)
+    Image3DModel.validate(image)
+    return image
 
 
 @inject_docs(px=PyxaKeys)
@@ -241,9 +277,20 @@ def pyxa(path: str | Path, dataset_id: str = "pyxa", image_path: str | Path | No
     as a ``Z_um`` column (the centre of the z-plane), since shapes are 2D in
     spatialdata. Both voxel sizes are inferred from ``{px.CELL_METADATA_FILE!r}``,
     whose per-cell centroids are the area-weighted centroids of each cell's
-    polygons in both units. Unassigned
-    transcripts (``cell_id`` ending in ``"_-1"``) are kept in the points
-    table, flagged via an ``assigned`` column, rather than dropped.
+    polygons in both units.
+
+    The polygons are returned as two shapes elements:
+
+        - ``{px.REGION!r}``: one 2D footprint per cell (the union of its z-plane
+          polygons), indexed by ``cell_id`` and annotated by the ``rna`` table.
+          Cells stacked in z have overlapping footprints, so use these for 2D
+          display and table annotation, not for 2D spatial aggregation (the
+          transcripts' ``cell_id`` already gives each transcript's cell).
+        - ``{px.CELL_BOUNDARIES_Z!r}``: the per-cell, per-z-plane polygons, with
+          ``cell_id``, ``ZIndex`` and ``Z_um`` columns.
+
+    Unassigned transcripts (``cell_id`` ending in ``"_-1"``) are kept in the
+    points element, flagged via an ``assigned`` column, rather than dropped.
 
     Parameters
     ----------
@@ -255,9 +302,9 @@ def pyxa(path: str | Path, dataset_id: str = "pyxa", image_path: str | Path | No
     image_path
         Optional path to a mosaic OME-Zarr (OME-NGFF v0.5) directory, e.g. a
         DAPI mosaic. Not colocated with the other 4 files in Pyxa's output
-        layout, so it must be given explicitly. Only the full-resolution
-        level is read (see :func:`_get_image`). If ``None``, no image is
-        included in the returned :class:`~spatialdata.SpatialData`.
+        layout, so it must be given explicitly. All pyramid levels in the store
+        are loaded as a multiscale image (see :func:`_get_image`). If ``None``,
+        no image is included in the returned :class:`~spatialdata.SpatialData`.
 
     Returns
     -------
@@ -281,7 +328,9 @@ def pyxa(path: str | Path, dataset_id: str = "pyxa", image_path: str | Path | No
     )
 
     xy_size, z_size = _get_voxel_size(metadata_path)
-    shapes = ShapesModel.parse(_get_shapes(geometries_path, xy_size, z_size))
+    planes = _get_shapes(geometries_path, xy_size, z_size)
+    footprints = ShapesModel.parse(_get_footprints(planes))
+    planes = ShapesModel.parse(planes)
 
     table = TableModel.parse(
         _get_table(by_gene_path, metadata_path),
@@ -299,7 +348,7 @@ def pyxa(path: str | Path, dataset_id: str = "pyxa", image_path: str | Path | No
 
     return SpatialData(
         points={"transcripts": points},
-        shapes={PyxaKeys.REGION.value: shapes},
+        shapes={PyxaKeys.REGION.value: footprints, PyxaKeys.CELL_BOUNDARIES_Z.value: planes},
         tables={"rna": table},
         images=images,
     )

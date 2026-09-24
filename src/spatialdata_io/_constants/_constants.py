@@ -444,7 +444,10 @@ class PyxaKeys(ModeEnum):
 
     # constructed metadata
     REGION_KEY = "region"
-    REGION = "cell_shapes"
+    # per-cell footprint (union of the cell's z-plane polygons), annotated by the table
+    REGION = "cell_boundaries"
+    # per-cell, per-z-plane polygons, as stored on disk
+    CELL_BOUNDARIES_Z = "cell_boundaries_z"
     INSTANCE_KEY = "cell_id"
     ASSIGNED = "assigned"
     MOSAIC_IMAGE = "mosaic_image"

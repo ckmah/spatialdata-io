@@ -11,12 +11,15 @@ import pytest
 import shapely
 import zarr
 from click.testing import CliRunner
-from spatialdata import get_extent, read_zarr
-from spatialdata.transformations import Identity, get_transformation
+from spatialdata import get_extent, match_element_to_table, match_table_to_element, read_zarr
+from spatialdata.models import get_table_keys
+from spatialdata.transformations import Identity, Scale, Sequence, Translation, get_transformation
+from xarray import DataTree
 
 from spatialdata_io.__main__ import pyxa_wrapper
 from spatialdata_io._constants._constants import PyxaKeys
 from spatialdata_io.readers.pyxa import (
+    _get_footprints,
     _get_image,
     _get_points,
     _get_shapes,
@@ -29,18 +32,22 @@ from spatialdata_io.readers.pyxa import (
 
 # See https://github.com/scverse/spatialdata-io/blob/main/.github/workflows/prepare_test_data.yaml for instructions on
 # how to download and place the data on disk
-FIXTURE_DIR = Path("./data") / "pyxa_xsmall"
+DATASETS = ["pyxa_xsmall"]
+FIXTURE_DIR = Path("./data") / DATASETS[0]
 MOSAIC_DIR = FIXTURE_DIR / "mosaic_3d.ome.zarr"
 
 
+TINY_SCALE0 = np.arange(2 * 4 * 4, dtype="uint8").reshape(1, 1, 2, 4, 4)
+# a constant rather than a downsampling of scale0, so a test can tell a loaded level from a recomputed one
+TINY_SCALE1 = np.full((1, 1, 1, 2, 2), 7, dtype="uint8")
+
+
 def _make_tiny_ome_zarr(path: Path) -> None:
-    """Build a minimal single-scale OME-NGFF v0.5 store, shape (t=1, c=1, z=2, y=4, x=4)."""
-    data = np.arange(2 * 4 * 4, dtype="uint8").reshape(1, 1, 2, 4, 4)
+    """Build a minimal two-level OME-NGFF v0.5 store, shapes (t=1, c=1, z=2, y=4, x=4) and (1, 1, 1, 2, 2)."""
     group = zarr.open_group(store=str(path), mode="w")
-    array = group.create_array(
-        "scale0/image", shape=data.shape, dtype=data.dtype, dimension_names=["t", "c", "z", "y", "x"]
-    )
-    array[:] = data
+    for name, data in (("scale0/image", TINY_SCALE0), ("scale1/image", TINY_SCALE1)):
+        array = group.create_array(name, shape=data.shape, dtype=data.dtype, dimension_names=["t", "c", "z", "y", "x"])
+        array[:] = data
     group.attrs["ome"] = {
         "version": "0.5",
         "multiscales": [
@@ -58,6 +65,13 @@ def _make_tiny_ome_zarr(path: Path) -> None:
                         "coordinateTransformations": [
                             {"type": "scale", "scale": [1.0, 1.0, 0.5, 0.2, 0.2]},
                             {"type": "translation", "translation": [0.0, 0.0, 1.0, 2.0, 3.0]},
+                        ],
+                    },
+                    {
+                        "path": "scale1/image",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [1.0, 1.0, 1.0, 0.4, 0.4]},
+                            {"type": "translation", "translation": [0.0, 0.0, 1.25, 2.1, 3.1]},
                         ],
                     },
                 ],
@@ -88,7 +102,8 @@ def test_pyxa_keys_columns() -> None:
     assert PyxaKeys.FOV == "FOV"
     assert PyxaKeys.UNASSIGNED_SUFFIX == "_-1"
     assert PyxaKeys.REGION_KEY == "region"
-    assert PyxaKeys.REGION == "cell_shapes"
+    assert PyxaKeys.REGION == "cell_boundaries"
+    assert PyxaKeys.CELL_BOUNDARIES_Z == "cell_boundaries_z"
     assert PyxaKeys.INSTANCE_KEY == "cell_id"
     assert PyxaKeys.ASSIGNED == "assigned"
 
@@ -144,7 +159,9 @@ def test_get_table_matches_raw_values() -> None:
     assert adata[sample_cell, sample_gene].to_df().iloc[0, 0] == raw_by_gene.loc[sample_cell, sample_gene]
 
     assert list(adata.obsm["spatial"][0]) == list(raw_metadata.loc[sample_cell, ["X_um", "Y_um", "Z_um"]])
-    assert (adata.obs["region"] == "cell_shapes").all()
+    assert (adata.obs["region"] == "cell_boundaries").all()
+    # an index named like the cell_id column breaks spatialdata's table joins
+    assert adata.obs.index.name is None
 
 
 def test_get_shapes_matches_raw_row_count() -> None:
@@ -154,6 +171,19 @@ def test_get_shapes_matches_raw_row_count() -> None:
     assert all(isinstance(c, str) for c in gdf["cell_id"])
     assert gdf.geometry.is_valid.all()
     assert set(gdf.geom_type) <= {"Polygon", "MultiPolygon"}
+    assert gdf.index.is_unique
+
+
+def test_get_footprints_is_union_of_planes() -> None:
+    planes = _get_shapes(FIXTURE_DIR / "segmentation_geometries_v1.parquet", xy_size=0.114984751, z_size=0.5)
+    footprints = _get_footprints(planes)
+    assert footprints.index.name == "cell_id"
+    assert footprints.index.is_unique
+    assert set(footprints.index) == set(planes["cell_id"])
+    assert footprints.geometry.is_valid.all()
+    # every z-plane polygon lies inside its cell's footprint
+    covered = footprints.loc[planes["cell_id"]].geometry.buffer(1e-9).covers(planes.geometry, align=False)
+    assert covered.all()
 
 
 def test_get_shapes_converts_to_um() -> None:
@@ -234,13 +264,14 @@ def _area_weighted_centroids(shapes: gpd.GeoDataFrame) -> pd.DataFrame:
 
 
 def test_pyxa_reader_shapes_in_um_with_identity_transform() -> None:
-    shapes = pyxa(FIXTURE_DIR)["cell_shapes"]
-    assert isinstance(get_transformation(shapes, to_coordinate_system="global"), Identity)
-    assert shapes.geometry.is_valid.all()
+    sdata = pyxa(FIXTURE_DIR)
+    for name in ("cell_boundaries", "cell_boundaries_z"):
+        assert isinstance(get_transformation(sdata[name], to_coordinate_system="global"), Identity)
+        assert sdata[name].geometry.is_valid.all()
 
 
 def test_pyxa_reader_shapes_aligned_with_cell_metadata() -> None:
-    shapes = pyxa(FIXTURE_DIR)["cell_shapes"]
+    shapes = pyxa(FIXTURE_DIR)["cell_boundaries_z"]
     metadata = pd.read_csv(FIXTURE_DIR / "cell_metadata_v1.csv", index_col="cell_id")
     # the per-cell metadata centroid is exactly the area-weighted centroid of the cell's polygon stack
     centroids = _area_weighted_centroids(shapes)
@@ -252,7 +283,8 @@ def test_pyxa_reader_builds_valid_sdata() -> None:
     sdata = pyxa(FIXTURE_DIR)
 
     assert "transcripts" in sdata.points
-    assert "cell_shapes" in sdata.shapes
+    assert "cell_boundaries" in sdata.shapes
+    assert "cell_boundaries_z" in sdata.shapes
     assert "rna" in sdata.tables
 
     raw_transcripts = pd.read_csv(FIXTURE_DIR / "cell_assigned_gene_v1.csv")
@@ -267,16 +299,30 @@ def test_pyxa_reader_missing_file_raises() -> None:
             pyxa(Path(tmpdir))
 
 
-def test_get_image_loads_full_resolution_level() -> None:
+def test_get_image_loads_all_scales() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         zarr_path = Path(tmpdir) / "tiny.ome.zarr"
         _make_tiny_ome_zarr(zarr_path)
 
         image = _get_image(zarr_path)
-        assert image.dims == ("c", "z", "y", "x")
-        assert image.shape == (1, 2, 4, 4)
-        assert list(image.coords["c"].values) == ["DAPI"]
-        np.testing.assert_array_equal(image.values, np.arange(2 * 4 * 4, dtype="uint8").reshape(1, 2, 4, 4))
+        assert isinstance(image, DataTree)
+        assert list(image.keys()) == ["scale0", "scale1"]
+        scale0, scale1 = image["scale0"]["image"], image["scale1"]["image"]
+        assert scale0.dims == ("c", "z", "y", "x")
+        assert list(scale0.coords["c"].values) == ["DAPI"]
+        # both levels are read from the store as written, not recomputed from scale0
+        np.testing.assert_array_equal(scale0.values, TINY_SCALE0[0])
+        np.testing.assert_array_equal(scale1.values, TINY_SCALE1[0])
+
+        expected = Sequence(
+            [Scale([0.5, 0.2, 0.2], axes=("z", "y", "x")), Translation([1.0, 2.0, 3.0], axes=("z", "y", "x"))]
+        )
+        affine = get_transformation(image, to_coordinate_system="global").to_affine_matrix(
+            ("z", "y", "x"), ("z", "y", "x")
+        )
+        np.testing.assert_allclose(affine, expected.to_affine_matrix(("z", "y", "x"), ("z", "y", "x")))
+        # coarser levels map to the same physical extent as scale0
+        assert get_extent(image) == get_extent(scale0)
 
 
 def test_pyxa_reader_includes_image_when_given() -> None:
@@ -286,14 +332,21 @@ def test_pyxa_reader_includes_image_when_given() -> None:
 
         sdata = pyxa(FIXTURE_DIR, image_path=zarr_path)
         assert "mosaic_image" in sdata.images
-        assert sdata["mosaic_image"].shape == (1, 2, 4, 4)
+        assert sdata["mosaic_image"]["scale0"]["image"].shape == (1, 2, 4, 4)
 
 
 def test_pyxa_reader_example_mosaic() -> None:
     sdata = pyxa(FIXTURE_DIR, image_path=MOSAIC_DIR)
     image = sdata["mosaic_image"]
-    assert image.dims == ("c", "z", "y", "x")
-    assert list(image.coords["c"].values) == ["DAPI"]
+    # all five precomputed pyramid levels are loaded
+    assert [image[k]["image"].shape for k in image] == [
+        (1, 200, 217, 218),
+        (1, 100, 109, 109),
+        (1, 50, 54, 54),
+        (1, 25, 27, 27),
+        (1, 12, 14, 13),
+    ]
+    assert list(image["scale0"]["image"].coords["c"].values) == ["DAPI"]
     # the mosaic is cropped to the same 100 um cube as the cells
     extent = get_extent(image)
     extent = {ax: (math.floor(extent[ax][0]), math.ceil(extent[ax][1])) for ax in extent}
@@ -306,14 +359,74 @@ def test_pyxa_reader_missing_image_raises() -> None:
             pyxa(FIXTURE_DIR, image_path=Path(tmpdir) / "does_not_exist.ome.zarr")
 
 
-def test_cli_pyxa() -> None:
+# See https://github.com/scverse/spatialdata-io/blob/main/.github/workflows/prepare_test_data.yaml for instructions on
+# how to download and place the data on disk
+@pytest.mark.parametrize(
+    "dataset,expected",
+    [("pyxa_xsmall", "{'z': (20, 121), 'y': (-5150, -5029), 'x': (889, 1014)}")],
+)
+def test_example_data_data_extent(dataset: str, expected: str) -> None:
+    f = Path("./data") / dataset
+    assert f.is_dir()
+    sdata = pyxa(f, image_path=f / "mosaic_3d.ome.zarr")
+
+    extent = get_extent(sdata, exact=False)
+    extent = {ax: (math.floor(extent[ax][0]), math.ceil(extent[ax][1])) for ax in extent}
+    assert str(extent) == expected
+
+
+@pytest.mark.parametrize("dataset", DATASETS)
+def test_example_data_index_integrity(dataset: str) -> None:
+    f = Path("./data") / dataset
+    assert f.is_dir()
+    sdata = pyxa(f, image_path=f / "mosaic_3d.ome.zarr")
+
+    if dataset == "pyxa_xsmall":
+        # fmt: off
+        # test elements
+        assert sdata["mosaic_image"]["scale0"]["image"].sel(c="DAPI", z=0.5, y=0.5, x=0.5).data.compute() == 42
+        assert sdata["mosaic_image"]["scale0"]["image"].sel(c="DAPI", z=100.5, y=108.5, x=109.5).data.compute() == 64
+        assert sdata["mosaic_image"]["scale0"]["image"].sel(c="DAPI", z=199.5, y=216.5, x=217.5).data.compute() == 58
+        transcripts = sdata["transcripts"].compute().loc[[0, 10000, 23494]]
+        assert transcripts["Gene"].tolist() == ["Epb41l2", "Lamb1", "Id2"]
+        assert transcripts["cell_id"].tolist() == ["Region_3645", "Region_4097", "Region_4776"]
+        assert np.allclose(transcripts["x"], [982.285445, 942.385736, 907.775326])
+        assert np.allclose(transcripts["z"], [29.5, 66.5, 111.5])
+        footprint = sdata["cell_boundaries"].loc["Region_3645"].geometry
+        assert np.isclose(footprint.centroid.x, 986.9741281150192)
+        assert np.isclose(footprint.area, 275.81904506259013)
+        planes = sdata["cell_boundaries_z"]
+        plane = planes[(planes["cell_id"] == "Region_3645") & (planes["ZIndex"] == 62)].iloc[0]
+        assert np.isclose(plane.geometry.centroid.x, 987.0888540837285)
+        assert np.isclose(plane.geometry.centroid.y, -5109.209873190636)
+        assert plane["Z_um"] == 31.25
+        assert sdata["rna"]["Region_3645", "Epb41l2"].X[0, 0] == 3
+        assert sdata["rna"]["Region_3645"].X.sum() == 132
+        # fmt: on
+
+        # test table annotation
+        region, region_key, instance_key = get_table_keys(sdata["rna"])
+        assert (region, region_key, instance_key) == ("cell_boundaries", "region", "cell_id")
+        matched_table = match_table_to_element(sdata, element_name=region, table_name="rna")
+        assert len(matched_table) == 187
+        assert matched_table.obs["cell_id"][:3].tolist() == ["Region_3641", "Region_3645", "Region_3647"]
+        elements, table = match_element_to_table(sdata, element_name=region, table_name="rna")
+        assert len(elements[region]) == len(table) == 187
+
+
+@pytest.mark.parametrize("dataset", DATASETS)
+def test_cli_pyxa(dataset: str) -> None:
+    f = Path("./data") / dataset
+    assert f.is_dir()
     runner = CliRunner()
     with TemporaryDirectory() as tmpdir:
         output_zarr = Path(tmpdir) / "data.zarr"
         result = runner.invoke(
             pyxa_wrapper,
-            ["--input", str(FIXTURE_DIR), "--output", str(output_zarr)],
+            ["--input", str(f), "--output", str(output_zarr), "--image-path", str(f / "mosaic_3d.ome.zarr")],
         )
         assert result.exit_code == 0, result.output
         sdata = read_zarr(output_zarr)
+        assert set(sdata.shapes) == {"cell_boundaries", "cell_boundaries_z"}
         assert "transcripts" in sdata.points
+        assert "mosaic_image" in sdata.images
