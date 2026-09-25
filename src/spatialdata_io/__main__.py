@@ -919,11 +919,33 @@ def macsima_wrapper(
     default=None,
     help="Path to a mosaic OME-Zarr image directory (e.g. DAPI). [default: None]",
 )
-def pyxa_wrapper(input: str, output: str, dataset_id: str = "pyxa", image_path: str | None = None) -> None:
+@click.option(
+    "--pyxa-studio",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False),
+    default=None,
+    help="Path to a Pyxa Studio export (cluster labels, UMAP) outside the input directory. [default: None]",
+)
+@click.option(
+    "--skip",
+    type=click.Choice(["cell_assigned_gene", "segmentation_geometries", "pyxa_studio"]),
+    multiple=True,
+    help="Optional input file to leave out even if present; repeatable. [default: none]",
+)
+def pyxa_wrapper(
+    input: str,
+    output: str,
+    dataset_id: str = "pyxa",
+    image_path: str | None = None,
+    pyxa_studio: str | None = None,
+    skip: tuple[str, ...] = (),
+) -> None:
     """Pyxa (Stellaromics) conversion to SpatialData."""
     from spatialdata_io.experimental import pyxa
 
-    sdata = pyxa(input, dataset_id=dataset_id, image_path=image_path)
+    inputs: dict[str, str | bool] = dict.fromkeys(skip, False)
+    if pyxa_studio is not None and "pyxa_studio" not in skip:
+        inputs["pyxa_studio"] = pyxa_studio
+    sdata = pyxa(input, dataset_id=dataset_id, image_path=image_path, **inputs)  # type: ignore[arg-type]
     sdata.write(output)
 
 

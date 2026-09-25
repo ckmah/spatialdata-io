@@ -51,20 +51,58 @@ def _get_points(path: Path) -> dd.DataFrame:
     return ddf
 
 
-def _get_table(cell_by_gene_path: Path, cell_metadata_path: Path) -> ad.AnnData:
-    by_gene = pd.read_csv(cell_by_gene_path, index_col=PyxaKeys.CELL_ID.value, dtype={PyxaKeys.CELL_ID.value: str})
-    metadata = pd.read_csv(cell_metadata_path, index_col=PyxaKeys.CELL_ID.value, dtype={PyxaKeys.CELL_ID.value: str})
+def _read_cells(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path, index_col=PyxaKeys.CELL_ID.value, dtype={PyxaKeys.CELL_ID.value: str})
 
-    _validate_columns(
-        metadata,
-        {PyxaKeys.X_UM.value, PyxaKeys.Y_UM.value, PyxaKeys.Z_UM.value},
-        cell_metadata_path.name,
-    )
+
+def _cluster_categorical(values: pd.Series) -> pd.Categorical[str]:
+    """Cluster labels as string categories, in numeric order when the labels are integers."""
+    present = values.dropna()
+    numeric = pd.to_numeric(present, errors="coerce")
+    if numeric.notna().all():
+        labels = numeric.astype(int).astype(str)
+        categories = [str(c) for c in sorted(numeric.astype(int).unique())]
+    else:
+        labels = present.astype(str)
+        categories = sorted(labels.unique())
+    return pd.Categorical(labels.reindex(values.index), categories=categories)
+
+
+def _get_table(
+    cell_by_gene_path: Path,
+    cell_metadata_path: Path,
+    pyxa_studio_path: Path | None = None,
+) -> ad.AnnData:
+    """Build the cell table from the counts and metadata, optionally with Pyxa Studio's clusters.
+
+    ``pyxa_studio`` lists only the cells that passed Pyxa's filters, so its ``Cluster``
+    (categorical) and ``obsm["X_umap"]`` are missing (NaN) for the other cells.
+    """
+    by_gene = _read_cells(cell_by_gene_path)
+    metadata = _read_cells(cell_metadata_path)
+
+    spatial_cols = [PyxaKeys.X_UM.value, PyxaKeys.Y_UM.value, PyxaKeys.Z_UM.value]
+    _validate_columns(metadata, set(spatial_cols), cell_metadata_path.name)
 
     metadata = metadata.loc[by_gene.index]
-    spatial_cols = [PyxaKeys.X_UM.value, PyxaKeys.Y_UM.value, PyxaKeys.Z_UM.value]
     adata = ad.AnnData(by_gene, obs=metadata.drop(columns=spatial_cols))
     adata.obsm["spatial"] = metadata[spatial_cols].values
+
+    if pyxa_studio_path is not None:
+        studio = _read_cells(pyxa_studio_path)
+        _validate_columns(studio, {PyxaKeys.CLUSTER.value}, pyxa_studio_path.name)
+        n_missing = int((~adata.obs_names.isin(studio.index)).sum())
+        if n_missing:
+            logger.info(
+                f"{pyxa_studio_path.name}: {n_missing} of {adata.n_obs} cells were filtered out by Pyxa Studio; "
+                f"their {PyxaKeys.CLUSTER.value!r} and {PyxaKeys.UMAP_KEY.value!r} are missing"
+            )
+        studio = studio.reindex(adata.obs_names)
+        adata.obs[PyxaKeys.CLUSTER.value] = _cluster_categorical(studio[PyxaKeys.CLUSTER.value])
+        umap_cols = [c for c in (PyxaKeys.X_UMAP.value, PyxaKeys.Y_UMAP.value, PyxaKeys.Z_UMAP.value) if c in studio]
+        if umap_cols:
+            adata.obsm[PyxaKeys.UMAP_KEY.value] = studio[umap_cols].to_numpy(dtype=np.float64)
+
     adata.obs[PyxaKeys.REGION_KEY.value] = pd.Series(PyxaKeys.REGION.value, index=adata.obs_names, dtype="category")
     adata.obs[PyxaKeys.CELL_ID.value] = adata.obs_names
     # the cell_id column carries the instance key; an index with the same name breaks table joins
@@ -254,17 +292,74 @@ def _get_image(path: Path) -> DataTree:
     return image
 
 
+InputPath = str | Path | bool | None
+
+RequiredPath = str | Path | None
+
+
+def _required(value: RequiredPath) -> str | Path | bool:
+    """A required file is never skipped; unset means it must be in ``path``."""
+    if isinstance(value, bool):
+        raise TypeError("cell_by_gene and cell_metadata are required; pass a path or leave them unset")
+    return True if value is None else value
+
+
+def _resolve_input(value: InputPath, path: Path | None, file_name: str) -> Path | None:
+    """Where to read one Pyxa file from, or ``None`` to skip it.
+
+    ``False`` skips the file. ``None`` reads ``path / file_name`` when that exists and skips it
+    otherwise; ``True`` requires it. A path reads that file, which must exist.
+    """
+    if value is False:
+        return None
+    if value is None or value is True:
+        candidate = path / file_name if path is not None else None
+        if candidate is not None and candidate.exists():
+            return candidate
+        if value is True:
+            raise FileNotFoundError(f"Expected Pyxa output file not found: {candidate or file_name}")
+        return None
+    explicit = Path(value)
+    if not explicit.exists():
+        raise FileNotFoundError(f"Expected Pyxa output file not found: {explicit}")
+    return explicit
+
+
 @inject_docs(px=PyxaKeys)
-def pyxa(path: str | Path, dataset_id: str = "pyxa", image_path: str | Path | None = None) -> SpatialData:
+def pyxa(
+    path: str | Path | None = None,
+    dataset_id: str = "pyxa",
+    image_path: str | Path | None = None,
+    *,
+    cell_by_gene: RequiredPath = None,
+    cell_metadata: RequiredPath = None,
+    cell_assigned_gene: InputPath = None,
+    segmentation_geometries: InputPath = None,
+    pyxa_studio: InputPath = None,
+) -> SpatialData:
     """
     Read *Pyxa* (Stellaromics) output.
 
-    This function reads the following files:
+    The ``rna`` table is always read, from two required files:
 
-        - ``{px.CELL_ASSIGNED_GENE_FILE!r}``: Transcript-level gene assignments.
-        - ``{px.CELL_BY_GENE_FILE!r}``: Per-cell gene expression counts.
-        - ``{px.CELL_METADATA_FILE!r}``: Per-cell metadata (volume, spatial coordinates).
-        - ``{px.SEGMENTATION_GEOMETRIES_FILE!r}``: Per-cell segmentation polygons.
+        - ``{px.CELL_BY_GENE_FILE!r}``: Per-cell gene expression counts, the table's ``X``.
+        - ``{px.CELL_METADATA_FILE!r}``: Per-cell metadata (volume, spatial coordinates), the
+          table's ``obs`` and ``obsm["spatial"]``.
+
+    Everything else is optional, each read when present:
+
+        - ``{px.CELL_ASSIGNED_GENE_FILE!r}``: Transcript-level gene assignments, as the
+          ``transcripts`` points.
+        - ``{px.SEGMENTATION_GEOMETRIES_FILE!r}``: Per-cell segmentation polygons, as shapes. The
+          table annotates the cell footprints only when these are read.
+        - ``{px.PYXA_STUDIO_FILE!r}``: Pyxa Studio's export of the cells that passed its filters,
+          adding ``{px.CLUSTER!r}`` (categorical) to the table's ``obs`` and the 3D UMAP as
+          ``obsm[{px.UMAP_KEY!r}]``. Cells it filtered out keep missing values there.
+        - A mosaic OME-Zarr image, given as ``image_path``.
+
+    Files are looked up in ``path`` by default. Pass a path for a file to read it from
+    elsewhere, and for an optional file ``False`` to skip it even if present (e.g. the
+    transcripts of a large Region) or ``True`` to require it.
 
     No public specification exists for this format at the time of writing; this
     reader is validated against the public demo dataset at
@@ -295,60 +390,74 @@ def pyxa(path: str | Path, dataset_id: str = "pyxa", image_path: str | Path | No
     Parameters
     ----------
     path
-        Path to the directory containing the 4 Pyxa output files.
+        Directory holding Pyxa's output files. ``None`` reads only the files given
+        explicitly, in which case ``cell_by_gene`` and ``cell_metadata`` must be.
     dataset_id
         Dataset identifier, currently unused for element naming (reserved for
         future multi-sample support).
     image_path
         Optional path to a mosaic OME-Zarr (OME-NGFF v0.5) directory, e.g. a
-        DAPI mosaic. Not colocated with the other 4 files in Pyxa's output
+        DAPI mosaic. Not colocated with the other files in Pyxa's output
         layout, so it must be given explicitly. All pyramid levels in the store
         are loaded as a multiscale image (see :func:`_get_image`). If ``None``,
         no image is included in the returned :class:`~spatialdata.SpatialData`.
+    cell_by_gene, cell_metadata
+        Required files: ``None`` (default) reads them from ``path``, a path reads that file.
+    cell_assigned_gene, segmentation_geometries, pyxa_studio
+        Optional files: ``None`` (default) reads one from ``path`` if present, a path reads
+        that file, ``False`` skips it and ``True`` requires it in ``path``.
 
     Returns
     -------
     :class:`spatialdata.SpatialData`
     """
-    path = Path(path)
-    assigned_gene_path = path / PyxaKeys.CELL_ASSIGNED_GENE_FILE.value
-    by_gene_path = path / PyxaKeys.CELL_BY_GENE_FILE.value
-    metadata_path = path / PyxaKeys.CELL_METADATA_FILE.value
-    geometries_path = path / PyxaKeys.SEGMENTATION_GEOMETRIES_FILE.value
+    directory = Path(path) if path is not None else None
+    if directory is not None and not directory.is_dir():
+        raise FileNotFoundError(f"Pyxa output directory not found: {directory}")
+    by_gene_path = _resolve_input(_required(cell_by_gene), directory, PyxaKeys.CELL_BY_GENE_FILE.value)
+    metadata_path = _resolve_input(_required(cell_metadata), directory, PyxaKeys.CELL_METADATA_FILE.value)
+    assigned_gene_path = _resolve_input(cell_assigned_gene, directory, PyxaKeys.CELL_ASSIGNED_GENE_FILE.value)
+    geometries_path = _resolve_input(segmentation_geometries, directory, PyxaKeys.SEGMENTATION_GEOMETRIES_FILE.value)
+    studio_path = _resolve_input(pyxa_studio, directory, PyxaKeys.PYXA_STUDIO_FILE.value)
+    if by_gene_path is None or metadata_path is None:  # unreachable: required inputs resolve or raise
+        raise FileNotFoundError("cell_by_gene and cell_metadata are required")
 
-    for p in (assigned_gene_path, by_gene_path, metadata_path, geometries_path):
-        if not p.exists():
-            raise FileNotFoundError(f"Expected Pyxa output file not found: {p}")
-
-    points = PointsModel.parse(
-        _get_points(assigned_gene_path),
-        coordinates={"x": PyxaKeys.X_UM.value, "y": PyxaKeys.Y_UM.value, "z": PyxaKeys.Z_UM.value},
-        feature_key=PyxaKeys.GENE.value,
-        instance_key=PyxaKeys.CELL_ID.value,
-    )
-
-    xy_size, z_size = _get_voxel_size(metadata_path)
-    planes = _get_shapes(geometries_path, xy_size, z_size)
-    footprints = ShapesModel.parse(_get_footprints(planes))
-    planes = ShapesModel.parse(planes)
-
-    table = TableModel.parse(
-        _get_table(by_gene_path, metadata_path),
-        region=PyxaKeys.REGION.value,
-        region_key=PyxaKeys.REGION_KEY.value,
-        instance_key=PyxaKeys.INSTANCE_KEY.value,
-    )
-
-    images = {}
     if image_path is not None:
         image_path = Path(image_path)
         if not image_path.exists():
             raise FileNotFoundError(f"Expected Pyxa mosaic image not found: {image_path}")
+    inputs = [p for p in (by_gene_path, metadata_path, assigned_gene_path, geometries_path, studio_path) if p]
+    logger.info(f"Reading Pyxa {', '.join(p.name for p in inputs)}")
+
+    points = {}
+    if assigned_gene_path is not None:
+        points["transcripts"] = PointsModel.parse(
+            _get_points(assigned_gene_path),
+            coordinates={"x": PyxaKeys.X_UM.value, "y": PyxaKeys.Y_UM.value, "z": PyxaKeys.Z_UM.value},
+            feature_key=PyxaKeys.GENE.value,
+            instance_key=PyxaKeys.CELL_ID.value,
+        )
+
+    shapes = {}
+    if geometries_path is not None:
+        xy_size, z_size = _get_voxel_size(metadata_path)
+        planes = _get_shapes(geometries_path, xy_size, z_size)
+        shapes[PyxaKeys.REGION.value] = ShapesModel.parse(_get_footprints(planes))
+        shapes[PyxaKeys.CELL_BOUNDARIES_Z.value] = ShapesModel.parse(planes)
+
+    adata = _get_table(by_gene_path, metadata_path, studio_path)
+    if shapes:
+        table = TableModel.parse(
+            adata,
+            region=PyxaKeys.REGION.value,
+            region_key=PyxaKeys.REGION_KEY.value,
+            instance_key=PyxaKeys.INSTANCE_KEY.value,
+        )
+    else:
+        table = TableModel.parse(adata)
+
+    images = {}
+    if image_path is not None:
         images[PyxaKeys.MOSAIC_IMAGE.value] = _get_image(image_path)
 
-    return SpatialData(
-        points={"transcripts": points},
-        shapes={PyxaKeys.REGION.value: footprints, PyxaKeys.CELL_BOUNDARIES_Z.value: planes},
-        tables={"rna": table},
-        images=images,
-    )
+    return SpatialData(points=points, shapes=shapes, tables={"rna": table}, images=images)

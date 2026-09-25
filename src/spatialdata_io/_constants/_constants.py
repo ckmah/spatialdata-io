@@ -423,6 +423,8 @@ class PyxaKeys(ModeEnum):
     CELL_BY_GENE_FILE = "cell_by_gene_v1.csv"
     CELL_METADATA_FILE = "cell_metadata_v1.csv"
     SEGMENTATION_GEOMETRIES_FILE = "segmentation_geometries_v1.parquet"
+    # Pyxa Studio export: cells that passed Pyxa's filters, with cluster labels and a 3D UMAP
+    PYXA_STUDIO_FILE = "pyxa_studio_v1.csv"
 
     # shared columns
     CELL_ID = "cell_id"
@@ -438,6 +440,10 @@ class PyxaKeys(ModeEnum):
     Z_INDEX = "ZIndex"
     BORDER = "Border"
     FOV = "FOV"
+    CLUSTER = "Cluster"
+    X_UMAP = "X_UMAP"
+    Y_UMAP = "Y_UMAP"
+    Z_UMAP = "Z_UMAP"
 
     # unassigned transcripts have cell_id ending in this suffix, e.g. "Region_-1"
     UNASSIGNED_SUFFIX = "_-1"
@@ -451,3 +457,4 @@ class PyxaKeys(ModeEnum):
     INSTANCE_KEY = "cell_id"
     ASSIGNED = "assigned"
     MOSAIC_IMAGE = "mosaic_image"
+    UMAP_KEY = "X_umap"

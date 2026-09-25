@@ -87,6 +87,7 @@ def test_pyxa_keys_filenames() -> None:
     assert PyxaKeys.CELL_BY_GENE_FILE == "cell_by_gene_v1.csv"
     assert PyxaKeys.CELL_METADATA_FILE == "cell_metadata_v1.csv"
     assert PyxaKeys.SEGMENTATION_GEOMETRIES_FILE == "segmentation_geometries_v1.parquet"
+    assert PyxaKeys.PYXA_STUDIO_FILE == "pyxa_studio_v1.csv"
 
 
 def test_pyxa_keys_columns() -> None:
@@ -430,3 +431,110 @@ def test_cli_pyxa(dataset: str) -> None:
         assert set(sdata.shapes) == {"cell_boundaries", "cell_boundaries_z"}
         assert "transcripts" in sdata.points
         assert "mosaic_image" in sdata.images
+
+
+def _write_studio(path: Path, drop_every: int = 4) -> pd.DataFrame:
+    """A Pyxa Studio export for the fixture: every ``drop_every``-th cell filtered out, as Studio does."""
+    metadata = pd.read_csv(FIXTURE_DIR / "cell_metadata_v1.csv")
+    kept = metadata[np.arange(len(metadata)) % drop_every != 0].reset_index(drop=True)
+    rng = np.random.default_rng(0)
+    studio = pd.DataFrame(
+        {
+            "cell_id": kept["cell_id"],
+            "FOV": kept["FOV"],
+            "Volume_um3": kept["Volume_um3"],
+            "Z_pixels": kept["Z_pixels"],
+            "Y_pixels": kept["Y_pixels"],
+            "X_pixels": kept["X_pixels"],
+            "Cluster": np.arange(len(kept)) % 11,
+            "X_UMAP": rng.normal(size=len(kept)),
+            "Y_UMAP": rng.normal(size=len(kept)),
+            "Z_UMAP": rng.normal(size=len(kept)),
+        }
+    )
+    studio.to_csv(path, index=False)
+    return studio
+
+
+def test_get_table_joins_pyxa_studio(tmp_path: Path) -> None:
+    studio = _write_studio(tmp_path / "pyxa_studio_v1.csv").set_index("cell_id")
+    adata = _get_table(
+        FIXTURE_DIR / "cell_by_gene_v1.csv",
+        FIXTURE_DIR / "cell_metadata_v1.csv",
+        tmp_path / "pyxa_studio_v1.csv",
+    )
+    in_studio = adata.obs_names.isin(studio.index)
+    assert 0 < in_studio.sum() < adata.n_obs
+
+    cluster = adata.obs["Cluster"]
+    assert isinstance(cluster.dtype, pd.CategoricalDtype)
+    # numeric labels keep numeric order rather than string order ("10" after "9")
+    assert list(cluster.cat.categories) == [str(i) for i in range(11)]
+    assert cluster[~in_studio].isna().all()
+    cell = adata.obs_names[in_studio][0]
+    assert cluster[cell] == str(studio.loc[cell, "Cluster"])
+
+    umap = adata.obsm["X_umap"]
+    assert umap.shape == (adata.n_obs, 3)
+    assert np.isnan(umap[~in_studio]).all()
+    np.testing.assert_allclose(umap[in_studio][0], studio.loc[cell, ["X_UMAP", "Y_UMAP", "Z_UMAP"]])
+    # cell_metadata wins where both files describe a cell
+    assert "Volume_um3" in adata.obs and "UMAP" not in "".join(adata.obs.columns)
+
+
+def test_pyxa_reader_optional_inputs(tmp_path: Path) -> None:
+    studio_path = tmp_path / "pyxa_studio_v1.csv"
+    _write_studio(studio_path)
+
+    table_only = pyxa(FIXTURE_DIR, cell_assigned_gene=False, segmentation_geometries=False, pyxa_studio=studio_path)
+    assert not table_only.points and not table_only.shapes and not table_only.images
+    assert set(table_only.tables) == {"rna"}
+    assert "Cluster" in table_only["rna"].obs and "X_umap" in table_only["rna"].obsm
+    assert table_only["rna"].n_vars == pd.read_csv(FIXTURE_DIR / "cell_by_gene_v1.csv", nrows=1).shape[1] - 1
+
+    # no directory: the required files are given explicitly
+    explicit = pyxa(
+        cell_by_gene=FIXTURE_DIR / "cell_by_gene_v1.csv",
+        cell_metadata=FIXTURE_DIR / "cell_metadata_v1.csv",
+        image_path=MOSAIC_DIR,
+    )
+    assert set(explicit.tables) == {"rna"} and set(explicit.images) == {"mosaic_image"}
+    assert not explicit.points and not explicit.shapes
+
+    # the table annotates the footprints only when the polygons are read too
+    full = pyxa(FIXTURE_DIR, pyxa_studio=studio_path)
+    assert get_table_keys(full["rna"])[0] == "cell_boundaries"
+    assert "Cluster" in full["rna"].obs
+
+
+def test_pyxa_reader_required_and_skip(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="cell_by_gene_v1.csv"):
+        pyxa(cell_metadata=FIXTURE_DIR / "cell_metadata_v1.csv")
+    with pytest.raises(TypeError, match="required"):
+        pyxa(FIXTURE_DIR, cell_by_gene=False)
+    with pytest.raises(FileNotFoundError, match="pyxa_studio_v1.csv"):
+        pyxa(FIXTURE_DIR, pyxa_studio=True)
+    with pytest.raises(FileNotFoundError, match="nope.csv"):
+        pyxa(FIXTURE_DIR, pyxa_studio=tmp_path / "nope.csv")
+    with pytest.raises(FileNotFoundError, match="directory not found"):
+        pyxa(tmp_path / "missing")
+
+
+@pytest.mark.parametrize("dataset", DATASETS)
+def test_cli_pyxa_skip(dataset: str, tmp_path: Path) -> None:
+    f = Path("./data") / dataset
+    studio_path = tmp_path / "studio.csv"
+    _write_studio(studio_path)
+    output_zarr = tmp_path / "data.zarr"
+    result = CliRunner().invoke(
+        pyxa_wrapper,
+        [
+            "--input", str(f), "--output", str(output_zarr),
+            "--skip", "cell_assigned_gene", "--skip", "segmentation_geometries",
+            "--pyxa-studio", str(studio_path),
+        ],
+    )  # fmt: skip
+    assert result.exit_code == 0, result.output
+    sdata = read_zarr(output_zarr)
+    assert not sdata.points and not sdata.shapes
+    assert "Cluster" in sdata["rna"].obs
